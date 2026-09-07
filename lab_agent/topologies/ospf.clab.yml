@@ -1,0 +1,19 @@
+# Stub topology used by the Lab Agent when stub mode is enabled.
+# In production this is replaced with a real ContainerLab topology file
+# describing the vJunos / vrnetlab / linux containers for the lab.
+name: ospf
+topology:
+  nodes:
+    r1:
+      kind: linux
+      image: alpine:3.20
+    r2:
+      kind: linux
+      image: alpine:3.20
+    r3:
+      kind: linux
+      image: alpine:3.20
+  links:
+    - endpoints: ["r1:eth1", "r2:eth1"]
+    - endpoints: ["r2:eth2", "r3:eth1"]
+    - endpoints: ["r3:eth2", "r1:eth2"]

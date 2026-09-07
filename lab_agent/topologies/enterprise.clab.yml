@@ -1,0 +1,19 @@
+name: enterprise
+topology:
+  nodes:
+    r1:
+      kind: linux
+      image: alpine:3.20
+    r2:
+      kind: linux
+      image: alpine:3.20
+    sw1:
+      kind: linux
+      image: alpine:3.20
+    sw2:
+      kind: linux
+      image: alpine:3.20
+  links:
+    - endpoints: ["r1:eth1", "r2:eth1"]
+    - endpoints: ["r1:eth2", "sw1:eth1"]
+    - endpoints: ["r2:eth2", "sw2:eth1"]

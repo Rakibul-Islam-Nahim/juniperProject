@@ -1,0 +1,11 @@
+name: vlan
+topology:
+  nodes:
+    sw1:
+      kind: linux
+      image: alpine:3.20
+    sw2:
+      kind: linux
+      image: alpine:3.20
+  links:
+    - endpoints: ["sw1:eth1", "sw2:eth1"]

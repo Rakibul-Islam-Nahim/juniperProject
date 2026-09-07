@@ -1,0 +1,30 @@
+Metadata-Version: 2.4
+Name: lab-platform-backend
+Version: 0.1.0
+Summary: Backend Agent for the Automated MicroVM-Based Network Lab Platform
+License: Proprietary
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: asyncpg>=0.29
+Requires-Dist: psycopg2-binary>=2.9
+Requires-Dist: alembic>=1.13
+Requires-Dist: pydantic>=2.7
+Requires-Dist: pydantic-settings>=2.4
+Requires-Dist: httpx>=0.27
+Requires-Dist: websockets>=12
+Requires-Dist: structlog>=24.1
+Requires-Dist: anyio>=4.4
+Provides-Extra: dev
+Requires-Dist: pytest>=8.2; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"
+Requires-Dist: asgi-lifespan>=2.1; extra == "dev"
+Requires-Dist: aiosqlite>=0.20; extra == "dev"
+
+# Backend Agent
+
+FastAPI app for the Automated MicroVM-Based Network Lab Platform. See the top-level
+[`../README.md`](../README.md) for the full picture.

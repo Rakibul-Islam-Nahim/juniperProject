@@ -1,0 +1,34 @@
+Metadata-Version: 2.4
+Name: lab-agent
+Version: 0.1.0
+Summary: Lab Agent — runs inside each microVM and manages Docker/ContainerLab.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: httpx>=0.27
+Requires-Dist: pydantic>=2.7
+Requires-Dist: pydantic-settings>=2.4
+Requires-Dist: structlog>=24.1
+Provides-Extra: dev
+Requires-Dist: pytest>=8.2; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+
+# Lab Agent
+
+In-microVM service that owns Docker / ContainerLab / Juniper health and exposes a console
+WebSocket. See the top-level [`../README.md`](../README.md) for the architecture.
+
+## Endpoints
+
+| Verb | Path                       | Purpose                                  |
+|------|----------------------------|------------------------------------------|
+| GET  | `/health`                  | Liveness                                 |
+| GET  | `/status`                  | Current containerlab + per-device state  |
+| POST | `/start`                   | `containerlab deploy -t <topology>`      |
+| POST | `/stop`                    | `containerlab destroy -t <topology>`     |
+| WS   | `/console/{device?}`       | Stream device console bytes              |
+
+In development (no real containerlab / vrnetlab available), `containerlab.py` falls back to
+a stub: it launches simple Linux containers via Docker Compose as a stand-in for vJunos so
+the full backend↔agent loop is testable.

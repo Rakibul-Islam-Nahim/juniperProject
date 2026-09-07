@@ -1,0 +1,66 @@
+"""Local Cloud Hypervisor backend — STUB.
+
+Will be implemented when the VPS CH host details (binary path, API socket dir, golden-image
+directory, bridge name) are provided. The shape of this class mirrors `MockHypervisorBackend`
+so swapping the backend is a one-line config change (`HYPERVISOR_BACKEND=local_ch`).
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from pathlib import Path
+
+from app.hypervisor.base import HypervisorBackend, VMHandle, VMNotReady, VMStartError
+from app.logging import get_logger
+
+_log = get_logger("hypervisor.local_ch")
+
+
+class LocalCloudHypervisorBackend(HypervisorBackend):
+    def __init__(
+        self,
+        *,
+        ch_binary: str,
+        kernel_path: str,
+        image_dir: str,
+        disk_dir: str,
+        api_socket_dir: str,
+        bridge: str,
+        console_bind: str = "127.0.0.1:0",
+    ) -> None:
+        self._ch_binary = ch_binary
+        self._kernel_path = kernel_path
+        self._image_dir = image_dir
+        self._disk_dir = Path(disk_dir)
+        self._disk_dir.mkdir(parents=True, exist_ok=True)
+        self._socket_dir = Path(api_socket_dir)
+        self._socket_dir.mkdir(parents=True, exist_ok=True)
+        self._bridge = bridge
+        self._console_bind = console_bind
+
+    async def start(
+        self,
+        *,
+        lab_id: str,
+        image: str,
+        cpu: int,
+        memory_mb: int,
+        tap_name: str,
+        vm_ip: str,
+        gateway: str,
+        subnet: str,
+    ) -> VMHandle:
+        raise NotImplementedError(
+            "LocalCloudHypervisorBackend will be implemented once the VPS CH host "
+            "(binary, kernel, image directory, bridge name, network wiring) is available."
+        )
+
+    async def is_running(self, handle: VMHandle) -> bool:
+        raise NotImplementedError
+
+    async def wait_ready(self, handle: VMHandle, *, timeout_sec: float) -> None:
+        raise NotImplementedError
+
+    async def stop(self, handle: VMHandle) -> None:
+        raise NotImplementedError

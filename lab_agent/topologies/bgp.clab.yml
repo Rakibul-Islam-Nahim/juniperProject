@@ -1,0 +1,11 @@
+name: bgp
+topology:
+  nodes:
+    r1:
+      kind: linux
+      image: alpine:3.20
+    r2:
+      kind: linux
+      image: alpine:3.20
+  links:
+    - endpoints: ["r1:eth1", "r2:eth1"]
