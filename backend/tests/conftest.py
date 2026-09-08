@@ -33,6 +33,10 @@ from app.config import get_settings  # noqa: E402
 
 get_settings.cache_clear()
 
+# Make sure the IPAM HTTP client in tests points at an unused port. Tests that
+# need real allocation behaviour patch `wf._ipam_client` directly.
+os.environ.setdefault("IPAM_SERVICE_URL", "http://localhost:8100")
+
 from app import db as app_db  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.models import Base  # noqa: E402
@@ -104,6 +108,49 @@ async def _patch_app_engine(monkeypatch, engine):
             continue
         if hasattr(mod, "SessionLocal"):
             monkeypatch.setattr(mod, "SessionLocal", factory)
+    yield
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _patch_ipam_client(monkeypatch):
+    """Replace the real IPAM HTTP client with an in-memory fake for every test.
+
+    Tests that exercise `wf.run_lab` / `wf.destroy_lab` indirectly (via the
+    REST API) would otherwise try to POST to a real http://localhost:8100
+    service which isn't running. Tests that need to inspect IPAM state can
+    access the fake via `monkeypatch` or the `fake_ipam` fixture in
+    test_e2e_workflow.py.
+    """
+    import ipaddress
+
+    from app.ipam_client.client import AllocationResult
+
+    class _BuiltinFakeIPAM:
+        def __init__(self) -> None:
+            self._net = ipaddress.ip_network("172.30.0.0/24", strict=False)
+            self._blocks = [str(b) for b in self._net.subnets(new_prefix=28)]
+            self._next = 0
+
+        async def allocate(self, lab_id: str) -> AllocationResult:
+            if self._next >= len(self._blocks):
+                raise IPAMUnavailable_for_test("ipam exhausted in test fake")
+            subnet = self._blocks[self._next]
+            self._next += 1
+            net = ipaddress.ip_network(subnet, strict=False)
+            return AllocationResult(
+                subnet=subnet,
+                gateway=str(net.network_address + 1),
+                vm_ip=str(net.network_address + 10),
+            )
+
+        async def release(self, lab_id: str) -> None:
+            return None  # best-effort, idempotent
+
+    class IPAMUnavailable_for_test(RuntimeError):
+        pass
+
+    fake = _BuiltinFakeIPAM()
+    monkeypatch.setattr(wf, "_ipam_client", fake)
     yield
 
 

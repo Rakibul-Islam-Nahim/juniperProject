@@ -33,6 +33,12 @@ class Settings(BaseSettings):
     cpu_quota: int = Field(default=64)
     mem_quota_mb: int = Field(default=131072)
 
+    # External services
+    # The standalone ipam-service runs on port 8100 inside the docker network.
+    # When run via docker-compose this resolves to the service name. For local
+    # development (running backend outside docker), point at http://localhost:8100.
+    ipam_service_url: str = Field(default="http://ipam-service:8100")
+
     # Hypervisor
     hypervisor_backend: Literal["mock", "local_ch"] = Field(default="mock")
     ch_binary: str = Field(default="/usr/local/bin/cloud-hypervisor")

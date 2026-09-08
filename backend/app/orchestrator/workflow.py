@@ -24,7 +24,7 @@ from app.db import SessionLocal
 from app.events.service import record_event, transition_status
 from app.hypervisor.base import HypervisorBackend, VMHandle, VMStartError
 from app.hypervisor.factory import build_backend
-from app.ipam.service import IPAMExhausted, IPAMService
+from app.ipam_client.client import IPAMClient, IPAMExhausted, IPAMUnavailable
 from app.lab_agent_client.client import LabAgentClient, LabAgentError
 from app.logging import get_logger, lab_id_var
 from app.models import Lab
@@ -37,7 +37,7 @@ _log = get_logger("orchestrator")
 
 # Module-level singletons — built once at startup.
 _settings: Settings = get_settings()
-_ipam: IPAMService = IPAMService.from_settings()
+_ipam_client: IPAMClient = IPAMClient.from_settings()
 _resources: ResourceManager = ResourceManager.from_settings()
 _networking: NetworkingService = NetworkingService.from_settings()
 _hypervisor: HypervisorBackend = build_backend(_settings)
@@ -77,13 +77,21 @@ async def _run_lab_impl(lab_id: str, *, lab_type: str, cpu: int, memory_mb: int)
         await transition_status(db, lab, LabStatus.CREATING, message="resources checked")
         await db.commit()
 
-    # IP allocation
+    # IP allocation — delegated to the standalone ipam-service over HTTP.
     async with SessionLocal() as db:
         lab = (await db.execute(select(Lab).where(Lab.id == lab_id))).scalar_one()
         try:
-            alloc = await _ipam.allocate(db, lab_id)
+            alloc = await _ipam_client.allocate(lab_id)
         except IPAMExhausted as e:
             await transition_status(db, lab, LabStatus.FAILED, message=str(e))
+            await db.commit()
+            raise
+        except IPAMUnavailable as e:
+            _log.error("ipam.unavailable.on_allocate", error=str(e))
+            await transition_status(
+                db, lab, LabStatus.FAILED,
+                message=f"IPAM service unavailable: {e}",
+            )
             await db.commit()
             raise
 
@@ -256,12 +264,15 @@ async def _destroy_lab_impl(lab_id: str) -> None:
         except Exception as e:  # noqa: BLE001
             _log.warning("destroy.tap.remove.error", error=str(e))
 
-    # IPAM release
+    # IPAM release — best-effort (no retries). A leaked subnet row can be
+    # cleaned up later; we still proceed with the rest of destroy so the lab
+    # always reaches DESTROYED even if ipam-service is unhealthy.
+    try:
+        await _ipam_client.release(lab_id)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("destroy.ipam.release.error", error=str(e))
+
     async with SessionLocal() as db:
-        try:
-            await _ipam.hard_release(db, lab_id)
-        except Exception as e:  # noqa: BLE001
-            _log.warning("destroy.ipam.release.error", error=str(e))
         await transition_status(db, lab, LabStatus.RESOURCES_RELEASED, message="ipam + tap released")
         await db.commit()
 

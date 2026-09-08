@@ -1,709 +1,1047 @@
 # Automated MicroVM Network Lab Platform
 
-An on-demand, isolated network-lab platform that boots **Juniper routers and switches** inside
-**Cloud Hypervisor microVMs** running **ContainerLab**, then gives each student a private,
-console-attached lab they can tear down with a single API call.
+An on-demand, isolated network-lab platform that boots **Juniper routers and switches**
+inside **Cloud Hypervisor microVMs** running **ContainerLab**, then gives each student a
+private, console-attached lab they can tear down with a single API call.
 
-This repository ships the **Backend Agent** (orchestrator, REST + WebSocket API, IPAM) and a
-reference **Lab Agent** that runs *inside* the microVM. The hypervisor itself is pluggable:
-today a built-in mock backend runs the full lifecycle on a developer workstation; tomorrow the
-same backend talks to a real Cloud Hypervisor host on a separate VPS.
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Student Browser                                                   │
+│     │  POST /api/v1/labs                                           │
+│     │  GET  /api/v1/labs/{id}                                      │
+│     │  WS   /api/v1/labs/{id}/terminal?device=r1                   │
+│     │  DELETE /api/v1/labs/{id}                                    │
+└──────────────┬─────────────────────────────────────────────────────┘
+               │
+               ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Backend Agent    :8000   (Docker, privileged, host network)       │
+│  FastAPI · state machine · REST + WebSocket · calls IPAM via HTTP  │
+└──────────────┬─────────────────────────────────────────────────────┘
+               │   HTTP /allocate, /release
+               ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  IPAM Service     :8100   (Docker)                                 │
+│  FastAPI · owns the ip_allocations table                           │
+└──────────────┬─────────────────────────────────────────────────────┘
+               │   asyncpg
+               ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  PostgreSQL 16    :5432   (Docker, persistent volume)              │
+└────────────────────────────────────────────────────────────────────┘
+
+                ┌──────────────────────────────┐
+                │ MicroVM (per student lab)    │ ← cloud-hypervisor
+                │  Lab Agent :9001             │
+                │  ContainerLab                │
+                │  vJunos / vMX / cRPD         │
+                └──────────────────────────────┘
+```
 
 ---
 
 ## Table of contents
 
 1. [Introduction](#1-introduction)
-2. [Overview](#2-overview)
+2. [Repository layout](#2-repository-layout)
 3. [Architecture](#3-architecture)
-4. [Repository layout](#4-repository-layout)
-5. [Lab state machine](#5-lab-state-machine)
-6. [End-to-end guide: provisioning Cloud Hypervisor + ContainerLab + Juniper](#6-end-to-end-guide-provisioning-cloud-hypervisor--containerlab--juniper)
-7. [Quickstart: backend on your workstation](#7-quickstart-backend-on-your-workstation)
-8. [API reference](#8-api-reference)
-9. [Configuration](#9-configuration)
-10. [Logging](#10-logging)
-11. [Testing — input/output validation (backend only)](#11-testing--inputoutput-validation-backend-only)
+4. [Lab lifecycle — state machine](#4-lab-lifecycle--state-machine)
+5. [Quickstart — full stack with Docker](#5-quickstart--full-stack-with-docker)
+6. [Quickstart — native development (no Docker)](#6-quickstart--native-development-no-docker)
+7. [REST API reference](#7-rest-api-reference)
+   - 7.1 [Backend Agent](#71-backend-agent-port-8000)
+   - 7.2 [IPAM Service](#72-ipam-service-port-8100)
+8. [WebSocket API reference](#8-websocket-api-reference)
+9. [Configuration reference](#9-configuration-reference)
+10. [Operational commands](#10-operational-commands)
+11. [Testing](#11-testing)
 12. [Adding a new lab type](#12-adding-a-new-lab-type)
-13. [License](#13-license)
+13. [Troubleshooting](#13-troubleshooting)
+14. [License](#14-license)
 
 ---
 
 ## 1. Introduction
 
 Networking students and engineers need realistic, isolated hands-on labs. Physical gear
-doesn't scale, full-router simulators on the host don't isolate per-student state, and naive
-Docker-based topologies miss the real Junos boot path.
+doesn't scale, full-router simulators on the host don't isolate per-student state, and
+naive Docker-based topologies miss the real Junos boot path.
 
-This platform solves that by **running every student's lab inside its own microVM** booted from
-a pre-baked *golden image* (a Cloud Hypervisor root disk containing Docker, ContainerLab,
-vrnetlab, and the relevant Juniper image files). Each lab gets:
+This platform solves that by **running every student's lab inside its own microVM**
+booted from a pre-baked *golden image* — a Cloud Hypervisor root disk containing Docker,
+ContainerLab, vrnetlab, and the relevant Juniper image files. Each lab gets:
 
 - A dedicated `/24` carved out of the platform's IPAM pool.
-- A TAP interface plumbed onto a host bridge so the microVM has L2 connectivity.
+- A TAP interface plumbed onto the host bridge so the microVM has L2 connectivity.
 - A private ContainerLab topology the student can SSH / console into.
 - A hard kill-switch (`DELETE /labs/{id}`) that releases every resource, top-to-bottom.
 
-The student only ever sees the **Backend Agent API**. They never need to know what hypervisor
-runs underneath.
+The student only ever sees the **Backend Agent API**. They never need to know what
+hypervisor runs underneath.
 
-## 2. Overview
+**Status:** MVP backend. The hypervisor is pluggable — `mock` for laptops, `local_ch`
+for the production Cloud Hypervisor VPS. The IPAM service runs as a separate
+microservice so address management can be deployed and scaled independently.
 
-| What this repo is | What this repo isn't |
-|---|---|
-| A FastAPI Backend Agent that owns lab lifecycles | A UI / frontend |
-| A reference Lab Agent that runs *inside* the microVM | The Cloud Hypervisor host binary itself |
-| An IPAM + state machine + orchestrator + WS console gateway | A replacement for ContainerLab or Junos |
-| Mock-hypervisor mode for full local development | A production multi-tenant SaaS (yet) |
+---
 
-**Current status:** MVP backend. The hypervisor backend is abstracted behind
-`HypervisorBackend`; the in-repo `MockHypervisorBackend` simulates the VM lifecycle on a
-background asyncio task so the entire state machine can be exercised on a laptop. When the
-Cloud Hypervisor VPS comes online, only `LocalCloudHypervisorBackend` needs to be implemented —
-no orchestrator, API, or Lab Agent changes are required.
-
-## 3. Architecture
-![Architecture_Diagram](github-content/Architecture_Diagram.png)
-
-**Component responsibilities:**
-
-| Component | Path | Role |
-|---|---|---|
-| **Backend Agent** | `backend/app/` | FastAPI app. Owns the database, drives the state machine, proxies to Lab Agent. |
-| **IPAM** | `backend/app/ipam/service.py` | Carves `IPAM_POOL` into `/24` blocks; allocates/releases atomically with `SELECT … FOR UPDATE`. |
-| **ResourceManager** | `backend/app/resources/manager.py` | Enforces `MAX_LABS_PER_HOST`, `CPU_QUOTA`, `MEM_QUOTA_MB`. |
-| **Orchestrator** | `backend/app/orchestrator/workflow.py` | The async coroutine `run_lab()` that walks `REQUESTED → … → LAB_READY` (and `destroy_lab()` for cleanup). |
-| **HypervisorBackend** | `backend/app/hypervisor/{base,mock,local_ch}.py` | Protocol + impls. `mock` today; `local_ch` ships once the VPS is wired. |
-| **Networking** | `backend/app/networking/service.py` | TAP creation / attachment / removal on the host bridge. No-op in mock mode. |
-| **Lab Agent client** | `backend/app/lab_agent_client/client.py` | `httpx.AsyncClient` wrapper that calls `/health`, `/status`, `/start`, `/stop` and opens the console WebSocket. |
-| **Terminal gateway** | `backend/app/terminal/gateway.py` | Bridges a student browser WebSocket ⇄ the in-VM Lab Agent console WebSocket. |
-| **Lab Agent** | `lab_agent/app/` | Tiny FastAPI service that runs inside the microVM. Owns ContainerLab and exposes the console stream. |
-| **ContainerLab** | (inside the VM) | Deploys the topology (`vrnetlab` provides vJunos / vMX / cRPD containers). |
-| **Cloud Hypervisor** | (the VPS) | Boots microVMs from golden images; exposes an HTTP API socket. Stubbed in this repo for now. |
-
-## 4. Repository layout
+## 2. Repository layout
 
 ```
 juniperProject/
 ├── README.md                          ← you are here
-├── Makefile                           ← venv, install, up, down, migrate, backend-bg, agent-bg, test, clean
-├── docker-compose.yml                 ← Postgres 16 + volume + healthcheck
-├── .env.example                       ← every supported env var
-├── scripts/
-│   ├── test_ws.py                     ← end-to-end WebSocket smoke test (through the gateway)
-│   └── test_ws_direct.py              ← end-to-end WebSocket smoke test (direct to the lab agent)
-├── backend/
+├── Makefile                           ← install / up / down / migrate / test / clean
+├── docker-compose.yml                 ← postgres + ipam-service + backend
+├── .env / .env.example                ← every supported env var
+├── document.md                        ← historical / long-form notes
+│
+├── backend/                           ← Backend Agent (FastAPI)
 │   ├── pyproject.toml                 ← package: lab-platform-backend
+│   ├── Dockerfile                     ← container image
+│   ├── .dockerignore
 │   ├── README.md
 │   ├── alembic.ini
 │   ├── alembic/versions/0001_init.py  ← creates labs, ip_allocations, lab_events
 │   ├── app/
-│   │   ├── main.py                    ← FastAPI factory + global exception handlers
-│   │   ├── config.py                  ← pydantic-settings (env-driven)
-│   │   ├── logging.py                 ← structlog + lab_id ContextVar
-│   │   ├── db.py                      ← async SQLAlchemy engine/session
-│   │   ├── models.py                  ← Lab, IPAllocation, LabEvent ORM
-│   │   ├── schemas.py                 ← Pydantic request/response models
-│   │   ├── state_machine.py           ← LabStatus enum + transition rules + progress %
-│   │   ├── deps.py                    ← FastAPI dependencies (db, settings)
-│   │   ├── registry.py                ← lab_type → (golden_image, topology, devices) map
-│   │   ├── ipam/service.py            ← IPAMService
-│   │   ├── orchestrator/workflow.py   ← run_lab() + destroy_lab()
-│   │   ├── hypervisor/{base,mock,local_ch,factory}.py
-│   │   ├── networking/service.py      ← TAP plumbing
-│   │   ├── lab_agent_client/client.py
-│   │   ├── terminal/gateway.py        ← WebSocket ⇄ WebSocket bridge
-│   │   ├── resources/manager.py
-│   │   ├── events/service.py          ← LabEvent audit trail
-│   │   └── api/{labs,health,ws}.py
-│   └── tests/
-│       ├── conftest.py                ← SQLite per session, autouse cleanup, app/engine swap
-│       ├── test_state_machine.py      ← 5 tests
-│       ├── test_ipam.py               ← 3 tests
-│       ├── test_api_labs.py           ← 7 tests
-│       └── test_e2e_workflow.py       ← 3 tests
-└── lab_agent/
-    ├── pyproject.toml                 ← package: lab-agent
-    └── app/
-        ├── main.py                    ← FastAPI app factory + lifespan (readiness loop)
-        ├── config.py
-        ├── routes.py                  ← /health, /status, /start, /stop, /console[/...]
-        ├── containerlab.py            ← deploy() / destroy() wrapper (stub mode)
-        ├── readiness.py               ← polls per-device readiness every 0.5 s
-        ├── state.py                   ← in-memory topology + per-device state
-        └── topologies/                ← stub .clab.yml for ospf, bgp, vlan, switching, enterprise
+│   │   ├── main.py                    ← FastAPI factory, lifespan, error handlers
+│   │   ├── config.py                  ← Settings (env-driven)
+│   │   ├── db.py                      ← async engine
+│   │   ├── deps.py                    ← DB session dep
+│   │   ├── models.py                  ← ORM: Lab, IPAllocation, LabEvent
+│   │   ├── schemas.py                 ← Pydantic request/response
+│   │   ├── state_machine.py           ← Lab lifecycle FSM
+│   │   ├── logging.py                 ← structlog + lab_id contextvar
+│   │   ├── registry.py                ← lab_type → golden_image
+│   │   ├── api/                       ← REST + WebSocket routes
+│   │   │   ├── health.py              ← /healthz, /readyz
+│   │   │   ├── labs.py                ← POST/GET/DELETE /api/v1/labs
+│   │   │   └── ws.py                  ← WS terminal gateway
+│   │   ├── events/service.py          ← transition_status, record_event
+│   │   ├── hypervisor/                ← VM lifecycle abstraction
+│   │   │   ├── base.py                ← ABC + VMHandle
+│   │   │   ├── mock.py                ← in-process mock
+│   │   │   ├── local_ch.py            ← real Cloud Hypervisor launcher
+│   │   │   └── factory.py             ← Settings → backend
+│   │   ├── ipam_client/client.py      ← HTTP client → ipam-service
+│   │   ├── lab_agent_client/client.py ← HTTP client → Lab Agent in VM
+│   │   ├── networking/service.py      ← TAP/bridge management
+│   │   ├── orchestrator/workflow.py   ← run_lab() / destroy_lab() coroutines
+│   │   ├── resources/manager.py       ← quota enforcement
+│   │   └── terminal/gateway.py        ← browser ⇄ Lab Agent WS bridge
+│   └── tests/                         ← pytest suite
+│
+├── ipam_service/                      ← Standalone IPAM microservice (FastAPI)
+│   ├── pyproject.toml                 ← package: lab-ipam-service
+│   ├── Dockerfile
+│   ├── .dockerignore
+│   ├── README.md
+│   └── app/
+│       ├── main.py                    ← FastAPI /allocate, /release, /status
+│       ├── config.py                  ← Settings (pool, prefix_len, db)
+│       ├── db.py                      ← async engine
+│       ├── models.py                  ← IPAllocation ORM
+│       └── service.py                 ← IPAMService class
+│
+├── lab_agent/                         ← In-microVM service (unchanged, not in Docker)
+│   ├── pyproject.toml
+│   ├── README.md
+│   ├── app/
+│   │   ├── main.py                    ← lifespan autodeploys topology
+│   │   ├── config.py                  ← topology_path, readiness settings
+│   │   ├── containerlab.py            ← containerlab CLI wrapper
+│   │   ├── state.py                   ← in-memory StateStore
+│   │   ├── readiness.py               ← TCP probe loop
+│   │   ├── routes.py                  ← /health, /status, /start, /stop, /console
+│   │   └── logging.py
+│   └── topologies/                    ← 5 YAML lab topologies (alpine stubs)
+│       ├── bgp.clab.yml
+│       ├── enterprise.clab.yml
+│       ├── ospf.clab.yml
+│       ├── switching.clab.yml
+│       └── vlan.clab.yml
+│
+├── scripts/                           ← WebSocket smoke tests
+│   ├── test_ws.py                     ← through backend gateway
+│   └── test_ws_direct.py              ← direct to Lab Agent
+│
+├── github-content/                    ← PNG diagrams (architecture, workflow)
+├── var/                               ← runtime artifacts (gitignored)
+│   ├── backend.log
+│   ├── ipam.log
+│   ├── agent.log
+│   ├── ch-sockets/                    ← cloud-hypervisor API sockets
+│   ├── ch-logs/                       ← cloud-hypervisor stdout/stderr
+│   └── runtime-disks/                 ← per-lab qcow2 overlays
+└── .venv/                             ← Python virtualenv
 ```
 
-## 5. Lab state machine
+---
 
-The Backend Agent is the single source of truth for lab state. Every transition is enforced
-by `backend/app/state_machine.py` (`assert_transition()`) and is recorded as a `LabEvent` row
-plus a structured log line.
+## 3. Architecture
 
-![Lab workflow](github-content/Lab_workflow.png)
+### Components
 
-**Rules:**
+| Component | Path | Role |
+|---|---|---|
+| **Backend Agent** | `backend/app/` | FastAPI on :8000. Owns the `labs` + `lab_events` tables. Drives the state machine. Proxies to Lab Agent (HTTP + WebSocket) and to the IPAM service (HTTP). |
+| **IPAM Service** | `ipam_service/app/` | FastAPI on :8100. **Exclusively owns** the `ip_allocations` table. The backend never touches that table directly. |
+| **Lab Agent** | `lab_agent/app/` | FastAPI on :9001, runs *inside* each microVM. Owns ContainerLab, exposes `/health`, `/status`, `/start`, `/stop`, and `/console/{device?}` WebSocket. |
+| **Postgres** | docker-compose | Single source of truth for lab metadata. Both services share it but write disjoint tables. |
+| **Cloud Hypervisor** | host binary | Launches microVMs from golden images; backend talks to its HTTP API over a per-lab unix socket. |
+| **Networking** | `backend/app/networking/` | TAP creation + bridge attachment via `ip` command. No-op in `mock` hypervisor mode. |
 
-- Any active state may transition to `STOPPING` (so `DELETE` always succeeds even if the lab
-  is mid-creation).
-- Any failure during creation transitions to `FAILED` with a `FailureReason`
-  (`QUOTA_EXCEEDED`, `VM_START_FAILED`, `CONTAINERLAB_FAILED`, `DEVICE_BOOT_FAILED`,
-  `HEALTH_CHECK_TIMEOUT`, `NETWORK_CONFIGURATION_FAILED`, `LAB_AGENT_UNREACHABLE`,
-  `CLEANUP_FAILED`).
-- `DESTROYED` and `FAILED` are terminal (a `FAILED` lab may still be cleaned up via `DELETE`).
-- `progress_pct()` returns 0–100 for the API's `progress` field.
+### Service boundaries
 
-## 6. End-to-end guide: provisioning Cloud Hypervisor + ContainerLab + Juniper
+```
+Backend ──HTTP──▶ IPAM (allocate / release)
+   │
+   ├──HTTP──▶ Lab Agent in VM (health / status / start / stop)
+   ├──WS────▶ Lab Agent in VM (console bridge)
+   ├──exec──▶ /usr/local/bin/cloud-hypervisor
+   └──exec──▶ ip tuntap / ip link  (TAP creation)
+```
 
-This is the "real" workflow the backend automates once `LocalCloudHypervisorBackend` is
-implemented. You can run it today on a Linux host with KVM access.
+The Backend is the only thing that touches `cloud-hypervisor` or the host networking
+stack. That's why the backend container runs with `--privileged` and `network_mode: host`.
 
-### 6.1. Prerequisites
+### Trust model
 
-A Linux VPS (Ubuntu 22.04+ or similar) with:
+| Surface | Trust | Reason |
+|---|---|---|
+| Backend Agent | Trusted | Drives everything; talks to CH, IPAM, and per-lab Lab Agents |
+| IPAM Service | Trusted | Tiny DB-backed address allocator |
+| Lab Agent in VM | Semi-trusted | Runs the student's lab; not exposed to other students |
+| MicroVM | Untrusted | One per student; isolated by TAP + bridge + per-VM `/24` |
+
+---
+
+## 4. Lab lifecycle — state machine
+
+Every lab moves through a strict, auditable FSM. The backend records each transition
+in `lab_events` (from_status, to_status, message, created_at).
+
+```
+   ┌──────────┐
+   │REQUESTED │ ← POST /api/v1/labs inserts row, kicks off run_lab()
+   └────┬─────┘
+        ▼
+   ┌──────────┐
+   │CREATING  │ ← resource quota check
+   └────┬─────┘
+        ▼
+   ┌───────────────────┐
+   │NETWORK_ALLOCATED  │ ← HTTP POST /allocate to ipam-service
+   └────┬──────────────┘
+        ▼
+   ┌──────────┐
+   │VM_STARTING│ ← cloud-hypervisor --net tap=tap-<lab_id>
+   └────┬─────┘
+        ▼
+   ┌──────────┐
+   │ VM_READY │ ← poll Lab Agent /health at http://<vm_ip>:9001/health
+   └────┬─────┘
+        ▼
+   ┌─────────────────────┐
+   │CONTAINERLAB_STARTING│ ← Lab Agent auto-deploys topology on its own boot
+   └────┬────────────────┘
+        ▼
+   ┌─────────────────┐
+   │DEVICES_BOOTING  │ ← poll /status until all devices ready
+   └────┬────────────┘
+        ▼
+   ┌──────────┐
+   │ LAB_READY│ ← 100% — student can connect
+   └────┬─────┘
+        │  DELETE /api/v1/labs/{id}
+        ▼
+   ┌──────────┐
+   │ STOPPING │
+   └────┬─────┘
+        ▼
+   ┌────────────┐
+   │VM_STOPPED  │ ← cloud-hypervisor /vm.shutdown
+   └────┬───────┘
+        ▼
+   ┌────────────────────┐
+   │RESOURCES_RELEASED  │ ← HTTP POST /release to ipam-service + TAP removal
+   └────┬───────────────┘
+        ▼
+   ┌──────────┐
+   │DESTROYED │ ← terminal
+   └──────────┘
+
+   (any state) ──on error──▶ ┌──────────┐
+                              │  FAILED  │ ← terminal; auto-cleanup
+                              └──────────┘
+```
+
+### Progress percentages (returned by `/api/v1/labs/{id}`)
+
+| Status | Progress |
+|---|---|
+| REQUESTED | 5 |
+| CREATING | 10 |
+| NETWORK_ALLOCATED | 20 |
+| VM_STARTING | 35 |
+| VM_READY | 55 |
+| CONTAINERLAB_STARTING | 70 |
+| DEVICES_BOOTING | 85 |
+| LAB_READY | 100 |
+| STOPPING | 95 |
+| VM_STOPPED | 50 |
+| RESOURCES_RELEASED | 25 |
+| DESTROYED | 100 |
+| FAILED | 100 |
+
+### Timing knobs
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `DEVICE_READINESS_TIMEOUT_SEC` | **1800** | How long the backend waits for all devices in the topology to become reachable. Juniper routers in vrnetlab take ~15 minutes to boot — do not lower this without testing. |
+| `DEVICE_READINESS_POLL_SEC` | 5 | Polling interval for `/status`. |
+| `LAB_AGENT_BASE_URL` | `http://172.30.0.10:9001` | Bootstrap URL for the **first** lab. Subsequent labs use `http://<their_own_vm_ip>:9001` (per-lab client built in `_wait_for_devices_ready`). |
+
+---
+
+## 5. Quickstart — full stack with Docker
+
+This is the recommended deployment. Everything runs in containers except the
+hypervisor binary and golden images, which live on the host.
+
+### Prerequisites
+
+- Docker 24+ and docker compose v2
+- A Linux host with KVM (`/dev/kvm` present and accessible)
+- `cloud-hypervisor` binary installed at `/usr/local/bin/cloud-hypervisor`
+- A Linux kernel image at `/var/lib/cloud-hypervisor/vmlinux`
+- One or more golden qcow2 images under `/var/lib/cloud-hypervisor/images/`
+  matching the names in `backend/app/registry.py`
+- (Optional) A host bridge `br0` configured with IP forwarding
+
+### Step 1 — Configure
+
+Copy `.env.example` to `.env` and adjust paths:
 
 ```bash
-# KVM + Cloud Hypervisor
-sudo apt update
-sudo apt install -y qemu-kvm libvirt-daemon-system cloud-image-utils
-# cloud-hypervisor binary — grab the latest release:
-curl -L https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/cloud-hypervisor -o /usr/local/bin/cloud-hypervisor
-chmod +x /usr/local/bin/cloud-hypervisor
-cloud-hypervisor --version
-
-# A Linux bridge (CH attaches microVM TAPs to it)
-sudo ip link add br0 type bridge
-sudo ip addr add 172.30.0.1/16 dev br0
-sudo ip link set br0 up
-
-# Enable IP forwarding so microVMs can reach the lab network
-sudo sysctl -w net.ipv4.ip_forward=1
+cp .env.example .env
+# Edit .env if your CH / kernel / image paths differ
 ```
 
-### 6.2. Build the golden image
-
-A *golden image* is a root disk that already contains Docker, ContainerLab, vrnetlab, the
-Juniper image files, and the Lab Agent. The backend boots a per-lab copy-on-write overlay off
-this image so the golden itself is never mutated.
+Required environment tweaks for production:
 
 ```bash
-# Create a 20 GB empty disk
-qemu-img create -f qcow2 /var/lib/cloud-hypervisor/images/ospf.qcow2 20G
-
-# Install Ubuntu cloud image into it (seed with cloud-init user-data that installs everything)
-wget https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img \
-     -O /tmp/ubuntu-base.img
-qemu-img convert -f qcow2 -O qcow2 /tmp/ubuntu-base.img /var/lib/cloud-hypervisor/images/ospf.qcow2
-
-# Boot once with virt-customize (or run an installer) to:
-#   · install docker, containerlab, vrnetlab (pip install)
-#   · drop your Juniper image tarballs into /opt/vrnetlab/<lab-type>/
-#   · copy the Lab Agent code into /opt/lab-agent and run it on boot (systemd unit)
-#   · drop a stub topology at /opt/lab-agent/topologies/ospf.clab.yml
-virt-customize -a /var/lib/cloud-hypervisor/images/ospf.qcow2 \
-    --run-command 'curl -fsSL https://get.docker.com | sh' \
-    --run-command 'pip install containerlab vrnetlab' \
-    --run-command 'systemctl enable --now lab-agent.service' \
-    --upload lab_agent/app:/opt/lab-agent/app \
-    --upload lab_agent/topologies/ospf.clab.yml:/opt/lab-agent/topologies/ospf.clab.yml
-```
-
-The resulting `ospf.qcow2` is your *golden image*. Repeat for `bgp.qcow2`, `vlan.qcow2`, etc.
-— one per `lab_type` in `backend/app/registry.py`.
-
-### 6.3. Configure networking
-
-Each lab gets its own TAP attached to `br0`:
-
-```bash
-# Hand-rolled example (the backend does this in networking/service.py):
-sudo ip tuntap add dev tap-lab-<id> mode tap
-sudo ip link set tap-lab-<id> master br0
-sudo ip link set tap-lab-<id> up
-
-# Tear down (DELETE /labs):
-sudo ip link set tap-lab-<id> nomaster
-sudo ip link delete tap-lab-<id>
-```
-
-The microVM's eth0 ends up on `br0`, with `vm_ip = <subnet>.10` and `gateway = <subnet>.1`.
-ContainerLab then attaches its own internal bridges to `eth0`-side veths.
-
-### 6.4. Boot the microVM with cloud-hypervisor
-
-This is roughly what `LocalCloudHypervisorBackend.start()` will produce (read the stub in
-`backend/app/hypervisor/local_ch.py` for the exact signature):
-
-```bash
-LAB_ID=lab-0123abcd
-TAP=tap-${LAB_ID}
-IMAGE=/var/lib/cloud-hypervisor/images/ospf.qcow2
-KERNEL=/var/lib/cloud-hypervisor/vmlinux
-API_SOCK=/var/lib/cloud-hypervisor/api-sockets/${LAB_ID}.sock
-DISK=/var/lib/cloud-hypervisor/runtime-disks/${LAB_ID}.qcow2  # overlay
-
-# Copy-on-write overlay so the golden image is never touched
-qemu-img create -f qcow2 -b ${IMAGE} -F qcow2 ${DISK}
-
-cloud-hypervisor \
-  --api-socket path=${API_SOCK} \
-  --kernel ${KERNEL} \
-  --disk path=${DISK} \
-  --cpus boot=4 \
-  --memory size=4G \
-  --net tap=${TAP},mac=52:54:00:12:34:56 \
-  --serial tty \
-  --console off \
-  --rng src=/dev/urandom \
-  --watchdog disabled
-
-# (CH is a long-running process — talk to it via its REST API on ${API_SOCK} for VM info,
-#  power-button, shutdown, etc.)
-```
-
-Once booted, the guest's user-data runs `lab-agent.service` which starts the Lab Agent on
-port 9001 inside the VM.
-
-### 6.5. Inside the microVM: run ContainerLab + vrnetlab + Juniper
-
-The Lab Agent inside the VM exposes:
-
-```
-GET  /health                    # liveness
-GET  /status                    # current state, per-device readiness
-POST /start   {lab_type, topology_path}
-POST /stop
-WS   /console/{device}          # streams the Juniper console bytes
-```
-
-A real Juniper topology (`ospf.clab.yml`) looks like:
-
-```yaml
-name: ospf
-topology:
-  nodes:
-    r1:
-      kind: juniper_vjunos-router
-      image: vrnetlab/vrnetlab-vjunos-router:22.4R1
-    r2:
-      kind: juniper_vjunos-router
-      image: vrnetlab/vrnetlab-vjunos-router:22.4R1
-    r3:
-      kind: juniper_vjunos-router
-      image: vrnetlab/vrnetlab-vjunos-router:22.4R1
-  links:
-    - endpoints: ["r1:eth1", "r2:eth1"]
-    - endpoints: ["r2:eth2", "r3:eth1"]
-    - endpoints: ["r3:eth2", "r1:eth2"]
-```
-
-The Backend Agent POSTs `/start` with `{lab_type: "ospf", topology_path: "/opt/lab-agent/topologies/ospf.clab.yml"}`.
-The Lab Agent runs:
-
-```bash
-containerlab deploy -t /opt/lab-agent/topologies/ospf.clab.yml
-```
-
-vrnetlab then provisions three vJunos-router containers (`clab-ospf-r1`, `clab-ospf-r2`,
-`clab-ospf-r3`), each running a real Junos VM reachable on `22` (SSH) and `830` (NETCONF).
-The readiness loop polls per-device until all three are up, then the backend transitions the
-lab to `LAB_READY`.
-
-### 6.6. Attach a console
-
-From the Backend Agent host:
-
-```bash
-# SSH to the Lab Agent, then docker exec into a container:
-ssh -p 9022 labagent@<vm_ip>
-docker exec -it clab-ospf-r1 cli   # vJunos: enters the Junos CLI
-# Or, from the student browser, the WebSocket gateway at
-#   ws://backend:8000/api/v1/labs/<lab_id>/terminal?device=r1
-#   pipes the same console bytes through to the in-VM Lab Agent.
-```
-
-### 6.7. Wire it into the backend
-
-When the VPS is online, point the backend at it and flip the backend flag:
-
-```bash
-# .env (or environment)
-HYPERVISOR_BACKEND=local_ch
+# .env
+DATABASE_URL=postgresql+asyncpg://lab:lab@postgres:5432/labplatform
+DATABASE_URL_SYNC=postgresql://lab:lab@postgres:5432/labplatform   # for alembic
+IPAM_SERVICE_URL=http://ipam-service:8100
+HYPERVISOR_BACKEND=local_ch                # NOT "mock" — that would skip real VMs
 CH_BINARY=/usr/local/bin/cloud-hypervisor
 CH_KERNEL=/var/lib/cloud-hypervisor/vmlinux
 CH_IMAGE_DIR=/var/lib/cloud-hypervisor/images
 CH_BRIDGE=br0
-CH_TAP_PREFIX=tap
-CH_DISK_DIR=/var/lib/cloud-hypervisor/runtime-disks
-CH_API_SOCKET_DIR=/var/lib/cloud-hypervisor/api-sockets
-LAB_AGENT_BASE_URL=http://<vm_ip_or_bridge_addr>:9001
+DEVICE_READINESS_TIMEOUT_SEC=1800           # DO NOT lower — Juniper needs ~15 min
 ```
 
-Implement `backend/app/hypervisor/local_ch.py` against the real `cloud-hypervisor` API
-(socket at `$CH_API_SOCKET_DIR/<lab_id>.sock`) using the `ch-remote` REST surface:
-`PUT /vm.info`, `PUT /vm.power-button`, `PUT /vm.shutdown`, etc. No other backend code needs
-to change.
-
-## 7. Quickstart: backend on your workstation
-
-This runs the entire backend with the **mock** hypervisor. No KVM, no Cloud Hypervisor, no
-real VMs — just the Backend Agent, Postgres, and the reference Lab Agent (both as FastAPI
-processes on the same machine).
+### Step 2 — Start everything
 
 ```bash
-# 1. Install Python deps into .venv (PEP 668 safe)
-make install
+make up-all          # postgres + ipam-service + backend
+```
 
-# 2. Start Postgres
-cp .env.example .env
+Equivalent to:
+
+```bash
+docker compose up -d postgres ipam-service
+docker compose up -d backend
+```
+
+### Step 3 — Apply database migrations
+
+```bash
+make migrate
+```
+
+This runs Alembic against the containerised postgres and creates `labs`,
+`ip_allocations`, `lab_events`.
+
+### Step 4 — Verify
+
+```bash
+# Backend
+curl -s http://localhost:8000/healthz
+# → {"status":"ok"}
+
+# IPAM
+curl -s http://localhost:8100/healthz
+# → {"status":"ok"}
+
+# IPAM pool status
+curl -s http://localhost:8100/status
+# → {"pool":"172.30.0.0/16","prefix_len":24,"total_blocks":256,"in_use":0,"free":256}
+
+# Backend readiness
+curl -s http://localhost:8000/readyz
+# → {"status":"ready","database":"ok","lab_agent":"ok"}  (or "degraded")
+```
+
+### Step 5 — Create your first lab
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/labs \
+  -H 'Content-Type: application/json' \
+  -d '{"lab_type":"router","cpu":4,"memory":"8G"}'
+```
+
+Response:
+
+```json
+{
+  "lab_id": "lab-7f8a1b2c3d4e",
+  "status": "REQUESTED",
+  "progress": 5,
+  "cpu": 4,
+  "memory_mb": 8192,
+  "subnet": null,
+  "gateway": null,
+  "vm_ip": null,
+  ...
+}
+```
+
+Poll `GET /api/v1/labs/{lab_id}` every few seconds until `status == "LAB_READY"`.
+
+### Step 6 — Connect to the lab
+
+```bash
+# Open a console to device r1 (WebSocket through the backend gateway)
+python scripts/test_ws.py lab-7f8a1b2c3d4e
+```
+
+### Step 7 — Tear down
+
+```bash
+curl -s -X DELETE http://localhost:8000/api/v1/labs/lab-7f8a1b2c3d4e
+```
+
+This runs `destroy_lab()`, which:
+1. Asks `cloud-hypervisor` to shut down the VM cleanly.
+2. Polls for graceful exit, escalates to SIGTERM/SIGKILL if needed.
+3. Removes the TAP interface.
+4. Calls `POST /release/{lab_id}` on the IPAM service.
+5. Transitions the lab to `DESTROYED`.
+
+### Step 8 — Stop everything
+
+```bash
+make down
+```
+
+Stops and removes all containers. Postgres data persists in the
+`labplatform_pgdata` volume.
+
+---
+
+## 6. Quickstart — native development (no Docker)
+
+Use this if you want to hack on the backend / IPAM without spinning up
+containers. Postgres still runs in docker.
+
+### Prerequisites
+
+- Python 3.11+
+- The same `cloud-hypervisor` setup as above (or use `HYPERVISOR_BACKEND=mock`
+  for an in-process simulator)
+
+### Steps
+
+```bash
+# 1. Bring up just postgres
 make up
-# (wait for "healthy")
+
+# 2. Install everything into .venv
+make install
 
 # 3. Apply migrations
 make migrate
 
-# 4. Start backend + lab agent in the background
-make backend-bg     # logs → var/backend.log
-make agent-bg       # logs → var/agent.log
+# 4. In separate terminals:
+make ipam-bg          # ipam-service on :8100, logs → var/ipam.log
+make backend-bg       # backend on :8000, logs → var/backend.log
+make agent-bg         # lab_agent on :9001 (only useful if you have a real VM)
 
-# 5. Smoke test
-curl -s http://localhost:8000/healthz
-# → {"status":"ok"}
-
-curl -s -XPOST http://localhost:8000/api/v1/labs \
-  -H 'content-type: application/json' \
-  -d '{"lab_type":"ospf","cpu":4,"memory":"4G"}'
-# → {"lab_id":"lab-<12-hex>","status":"REQUESTED", ...}
-
-# Poll status — it walks REQUESTED → … → LAB_READY in ~7 s
-curl -s http://localhost:8000/api/v1/labs/lab-<id>
-
-# Tear down
-curl -s -XDELETE http://localhost:8000/api/v1/labs/lab-<id>
-# → status walks STOPPING → VM_STOPPED → RESOURCES_RELEASED → DESTROYED
-
-# Tidy up
-make clean
+# 5. Tail logs
+tail -f var/backend.log
+tail -f var/ipam.log
 ```
 
-## 8. API reference
+Stop:
 
-Base URL: `http://<host>:8000`. All bodies are JSON. All errors use the envelope:
+```bash
+make clean            # kills ipam/backend/agent, removes var/
+```
+
+---
+
+## 7. REST API reference
+
+All requests/responses use JSON unless otherwise noted. Errors follow this
+envelope:
 
 ```json
-{ "error": { "code": "MACHINE_READABLE_CODE", "message": "human readable", "details": null } }
+{
+  "error": {
+    "code": "MACHINE_READABLE_CODE",
+    "message": "human readable explanation",
+    "details": null
+  }
+}
 ```
 
-| Verb | Path | Purpose |
-|---|---|---|
-| `POST` | `/api/v1/labs` | Create a lab. Async — returns `201` immediately with `status=REQUESTED`; the orchestrator continues in the background. |
-| `GET` | `/api/v1/labs` | List labs (optional `?status=LAB_READY&limit=50`). Newest first. |
-| `GET` | `/api/v1/labs/{lab_id}` | Single lab status + progress + network info. |
-| `DELETE` | `/api/v1/labs/{lab_id}` | Tear down a lab. Async — returns `202` with the *current* state; lifecycle continues. |
-| `WS` | `/api/v1/labs/{lab_id}/terminal?device=r1` | Bidirectional console stream. Only opens if status is `LAB_READY`; otherwise `4409 close`. |
-| `GET` | `/healthz` | Liveness (process up). |
-| `GET` | `/readyz` | Readiness: Postgres reachable AND Lab Agent reachable. |
+### 7.1 Backend Agent (port 8000)
 
-### `POST /api/v1/labs`
+Base URL: `http://<host>:8000`
+
+#### `GET /healthz`
+
+Liveness — always returns 200 if the process is up.
+
+```
+200 OK
+{"status": "ok"}
+```
+
+#### `GET /readyz`
+
+Readiness — checks Postgres and Lab Agent reachability.
+
+```
+200 OK  {"status": "ready",    "database": "ok", "lab_agent": "ok"}
+200 OK  {"status": "degraded", "database": "ok", "lab_agent": "down"}
+200 OK  {"status": "degraded", "database": "down", "lab_agent": "ok"}
+```
+
+(`/readyz` returns 200 in both ready and degraded states; clients should read
+the body.)
+
+#### `POST /api/v1/labs`
+
+Create a new lab. Kicks off the orchestrator workflow asynchronously.
 
 Request body:
 
 ```json
 {
-  "lab_type": "ospf",            // one of: ospf, bgp, vlan, switching, enterprise
-  "cpu": 4,                      // 1..64, default 4
-  "memory": "4G",                // <int>[MG], e.g. "4G", "8192M"
-  "user_id": "student-42"        // optional
+  "lab_type": "router",        // required, one of the registered types
+  "cpu": 4,                    // optional, default 4, range 1..64
+  "memory": "8G",              // optional, default "8G", format <int>[MG]
+  "user_id": "alice"           // optional, free-form identifier
 }
 ```
 
-Successful response (`201 Created`):
+Validation errors → `422`:
+
+```json
+{"error":{"code":"VALIDATION_ERROR","message":"request validation failed","details":[...]}}
+```
+
+Success → `201 Created`:
 
 ```json
 {
-  "lab_id": "lab-ba0680ce0368",
-  "user_id": "student-42",
-  "lab_type": "ospf",
-  "golden_image": "ospf.qcow2",
+  "lab_id": "lab-7f8a1b2c3d4e",
+  "user_id": null,
+  "lab_type": "router",
+  "golden_image": "router.qcow2",
   "status": "REQUESTED",
   "progress": 5,
   "cpu": 4,
-  "memory_mb": 4096,
-  "subnet": null, "gateway": null, "vm_ip": null, "vm_pid": null, "tap_name": null,
+  "memory_mb": 8192,
+  "subnet": null,
+  "gateway": null,
+  "vm_ip": null,
+  "vm_pid": null,
+  "tap_name": null,
   "error": null,
-  "created_at": "2026-08-26T12:40:05.493685Z",
-  "started_at": null, "ready_at": null, "terminated_at": null
-}
-```
-
-Errors:
-
-| Code | HTTP | When |
-|---|---|---|
-| `VALIDATION_ERROR` | 400 | bad `lab_type`, `cpu` out of range, malformed `memory`, etc. |
-| `INVALID_LAB_TYPE` | 400 | `lab_type` not in the registry. |
-| `QUOTA_EXCEEDED` | 409 | `MAX_LABS_PER_HOST` / `CPU_QUOTA` / `MEM_QUOTA_MB` would be exceeded. |
-
-### `GET /api/v1/labs/{lab_id}`
-
-Successful response (`200 OK`):
-
-```json
-{
-  "lab_id": "lab-ba0680ce0368",
-  "user_id": null,
-  "lab_type": "ospf",
-  "golden_image": "ospf.qcow2",
-  "status": "LAB_READY",
-  "progress": 100,
-  "cpu": 4, "memory_mb": 4096,
-  "subnet": "172.30.4.0/24",
-  "gateway": "172.30.4.1",
-  "vm_ip": "172.30.4.10",
-  "vm_pid": 15441001,
-  "tap_name": "tap-lab-ba0680ce",
-  "error": null,
-  "created_at": "2026-08-26T12:40:05.493685Z",
-  "started_at": "2026-08-26T12:40:05.947321Z",
-  "ready_at": "2026-08-26T12:40:12.282715Z",
+  "created_at": "2026-09-08T10:00:00Z",
+  "started_at": null,
+  "ready_at": null,
   "terminated_at": null
 }
 ```
 
-Errors: `INVALID_ID` (`400`), `LAB_NOT_FOUND` (`404`).
+#### `GET /api/v1/labs`
 
-### `GET /api/v1/labs`
+List labs, newest first.
 
-`200 OK` with an array of `LabResponse` (newest first; capped by `?limit=`).
+Query parameters:
 
-### `DELETE /api/v1/labs/{lab_id}`
+| Name | Type | Default | Notes |
+|---|---|---|---|
+| `status` | string | — | Filter by status (e.g. `LAB_READY`, `DESTROYED`) |
+| `limit` | int | 50 | Range 1..500 |
 
-`202 Accepted` with the lab's *current* state (orchestrator continues). Calling on an already
-`DESTROYED` lab returns `200` with that lab's record.
+```
+200 OK
+[
+  { "lab_id": "...", "status": "LAB_READY", ... },
+  ...
+]
+```
 
-### `WS /api/v1/labs/{lab_id}/terminal?device=r1`
+#### `GET /api/v1/labs/{lab_id}`
 
-- `101 Switching Protocols` if the lab is `LAB_READY`. Bytes flow bidirectionally.
-- `4404 close` if the lab doesn't exist.
-- `4409 close` if the lab exists but is not `LAB_READY`.
-- `1011 close` on internal error.
+Fetch one lab by ID. `lab_id` must match `[A-Za-z0-9_-]{1,64}`.
 
-The `device` query parameter is optional — defaults to the first device of the topology.
+```
+200 OK  { ... LabResponse ... }
+400     {"error":{"code":"INVALID_ID","message":"invalid lab id"}}
+404     {"error":{"code":"LAB_NOT_FOUND","message":"no lab <id>"}}
+```
 
-## 9. Configuration
+#### `DELETE /api/v1/labs/{lab_id}`
 
-All configuration is environment-driven. See `.env.example` for the authoritative list.
+Tear down a lab. Idempotent — calling on a `DESTROYED` lab returns the
+existing record. Otherwise kicks off `destroy_lab()` asynchronously and
+returns immediately.
 
-| Variable | Default | Meaning |
+```
+202 Accepted   { ... LabResponse with status=STOPPING ... }
+400            {"error":{"code":"INVALID_ID",...}}
+404            {"error":{"code":"LAB_NOT_FOUND",...}}
+```
+
+### 7.2 IPAM Service (port 8100)
+
+Base URL: `http://<host>:8100`
+
+The IPAM service is **internal** — the backend is its only normal client. The
+endpoints are documented here for operators and for completeness.
+
+#### `GET /healthz`
+
+```
+200 OK  {"status": "ok"}
+```
+
+#### `GET /readyz`
+
+Probes the database.
+
+```
+200 OK  {"status": "ready"}
+503     {"error":{"code":"DB_DOWN","message":"ipam db unreachable"}}
+```
+
+#### `POST /allocate`
+
+Allocate a `/IPAM_PREFIX_LEN` block to a lab.
+
+Request body:
+
+```json
+{"lab_id": "lab-7f8a1b2c3d4e"}
+```
+
+Success → `200 OK`:
+
+```json
+{
+  "subnet": "172.30.0.0/24",
+  "gateway": "172.30.0.1",
+  "vm_ip": "172.30.0.10"
+}
+```
+
+Pool exhausted → `503`:
+
+```json
+{"error":{"code":"IPAM_EXHAUSTED","message":"no free /24 blocks left in pool 172.30.0.0/16"}}
+```
+
+#### `POST /release/{lab_id}`
+
+Idempotently release the lab's allocation. Used by the backend during destroy.
+
+```
+200 OK  {"ok": true}
+```
+
+#### `GET /status`
+
+Pool stats.
+
+```
+200 OK
+{
+  "pool": "172.30.0.0/16",
+  "prefix_len": 24,
+  "total_blocks": 256,
+  "in_use": 3,
+  "free": 253
+}
+```
+
+#### `GET /allocations`
+
+Debug — list all currently active allocations.
+
+```
+200 OK
+[
+  {"lab_id":"lab-abc","subnet":"172.30.0.0/24","gateway":"172.30.0.1","vm_ip":"172.30.0.10","allocated_at":"..."},
+  ...
+]
+```
+
+---
+
+## 8. WebSocket API reference
+
+### `/api/v1/labs/{lab_id}/terminal?device={device_name}`
+
+WebSocket terminal gateway. The backend accepts the student's WS, validates
+that the lab is `LAB_READY`, then **bridges** the socket to the Lab Agent's
+console WebSocket inside the VM.
+
+**Closing codes the backend may send:**
+
+| Code | Meaning |
+|---|---|
+| 4404 | Lab not found |
+| 4409 | Lab not ready (status != `LAB_READY`) |
+| 4400 | Lab agent hasn't started topology yet |
+| 1011 | Internal error in the gateway |
+
+**Smoke test** (provided in `scripts/`):
+
+```bash
+# Through the backend gateway (preferred)
+python scripts/test_ws.py lab-7f8a1b2c3d4e
+
+# Direct to the Lab Agent (useful when debugging the VM-side service)
+python scripts/test_ws_direct.py
+```
+
+### Lab Agent direct WebSocket (in-VM)
+
+```
+ws://<vm_ip>:9001/console           # default device
+ws://<vm_ip>:9001/console/{device}  # specific device
+```
+
+Note: the Lab Agent console stream is currently a stub — see
+`lab_agent/app/routes.py`. A real vrnetlab-backed console implementation
+belongs to the per-golden-image Lab Agent build.
+
+---
+
+## 9. Configuration reference
+
+All settings are read by Pydantic from environment variables (or `.env`). See
+`.env.example` for the canonical list.
+
+### General
+
+| Variable | Default | Notes |
 |---|---|---|
-| `APP_NAME` | `lab-platform-backend` | Cosmetic, used in logs. |
-| `LOG_LEVEL` | `INFO` | structlog level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
-| `DATABASE_URL` | `postgresql+asyncpg://lab:lab@localhost:5432/labplatform` | Async SQLAlchemy URL. |
-| `DATABASE_URL_SYNC` | `postgresql://lab:lab@localhost:5432/labplatform` | Sync URL used by Alembic. |
-| `IPAM_POOL` | `172.30.0.0/16` | Pool carved into per-lab subnets. |
-| `IPAM_PREFIX_LEN` | `24` | Per-lab subnet size. |
-| `MAX_LABS_PER_HOST` | `10` | Max concurrent active labs. |
-| `CPU_QUOTA` | `64` | Aggregate vCPU cap across active labs. |
-| `MEM_QUOTA_MB` | `131072` | Aggregate memory cap (MiB) across active labs. |
-| `HYPERVISOR_BACKEND` | `mock` | `mock` (in-process simulator) or `local_ch` (real VPS — implement `local_ch.py`). |
-| `CH_BRIDGE` | `br0` | Linux bridge the microVM's TAP attaches to. |
-| `CH_TAP_PREFIX` | `tap` | TAP interface name prefix (e.g. `tap-lab-abc123`). |
-| `CH_DISK_DIR` | `./var/runtime-disks` | Where per-lab copy-on-write overlay disks live. |
-| `CH_API_SOCKET_DIR` | `./var/ch-sockets` | Where CH per-VM API sockets live. |
-| `CH_BINARY` | `/usr/local/bin/cloud-hypervisor` | (local_ch only) CH binary path. |
-| `CH_KERNEL` | `/var/lib/cloud-hypervisor/vmlinux` | (local_ch only) Direct-kernel boot path. |
-| `CH_IMAGE_DIR` | `/var/lib/cloud-hypervisor/images` | (local_ch only) Golden-image directory. |
-| `LAB_AGENT_BASE_URL` | `http://127.0.0.1:9001` | URL of the in-VM Lab Agent. |
-| `DEVICE_READINESS_TIMEOUT_SEC` | `600` | How long the orchestrator waits for ContainerLab devices. |
-| `DEVICE_READINESS_POLL_SEC` | `5` | Readiness poll interval. |
-| `BACKEND_HOST` | `0.0.0.0` | Bind address for uvicorn. |
-| `BACKEND_PORT` | `8000` | Bind port for uvicorn. |
+| `APP_NAME` | `lab-platform-backend` | Logged at startup |
+| `LOG_LEVEL` | `INFO` | `DEBUG` uses colored dev renderer; anything else uses JSON |
 
-## 10. Logging
+### Database
 
-`structlog` + a per-request `lab_id` `ContextVar`. Every log line emitted during a lab's
-lifecycle carries `lab_id` automatically.
+| Variable | Default |
+|---|---|
+| `DATABASE_URL` | `postgresql+asyncpg://lab:lab@localhost:5432/labplatform` |
+| `DATABASE_URL_SYNC` | `postgresql://lab:lab@localhost:5432/labplatform` |
 
-In dev (`LOG_LEVEL=DEBUG`), the console renderer is used:
+Inside Docker, the host is `postgres` (the compose service name). Outside, it's
+`localhost`.
 
-```
-2026-08-26 12:40:05 [info] orchestrator.transition  lab_id=lab-ba0680ce0368  from=REQUESTED  to=CREATING
-2026-08-26 12:40:06 [info] ipam.allocate             lab_id=lab-ba0680ce0368  subnet=172.30.4.0/24  vm_ip=172.30.4.10
-2026-08-26 12:40:06 [info] networking.create_tap     lab_id=lab-ba0680ce0368  tap=tap-lab-ba0680ce
-2026-08-26 12:40:07 [info] vm.start (mock)           lab_id=lab-ba0680ce0368  pid=15441001
-2026-08-26 12:40:08 [info] vm.ready (mock)           lab_id=lab-ba0680ce0368  pid=15441001
-2026-08-26 12:40:09 [info] containerlab.start        lab_id=lab-ba0680ce0368  lab_type=ospf
-2026-08-26 12:40:12 [info] devices.ready             lab_id=lab-ba0680ce0368  devices=['r1','r2','r3']
-```
+### IPAM
 
-In production, set `LOG_LEVEL=INFO` (or higher) to get JSON output suitable for ingestion
-into ELK / Loki / Cloud Logging.
+| Variable | Default | Notes |
+|---|---|---|
+| `IPAM_POOL` | `172.30.0.0/16` | Single CIDR. Sliced into `/IPAM_PREFIX_LEN` blocks. |
+| `IPAM_PREFIX_LEN` | `24` | Must be longer than the pool prefix. |
+| `IPAM_SERVICE_URL` | `http://ipam-service:8100` | Backend → IPAM. Override to `http://localhost:8100` when running backend natively. |
 
-## 11. Testing — input/output validation (backend only)
+### Resource quotas
 
-**No Cloud Hypervisor required.** Every command below runs against the Backend Agent with the
-in-process `MockHypervisorBackend` and the reference Lab Agent on `:9001`. Make sure both are
-up (`make backend-bg && make agent-bg`) before running.
+| Variable | Default |
+|---|---|
+| `MAX_LABS_PER_HOST` | `10` |
+| `CPU_QUOTA` | `64` |
+| `MEM_QUOTA_MB` | `131072` |
 
-### 11.1. Health
+### Hypervisor
 
-```bash
-$ curl -s http://localhost:8000/healthz
-{"status":"ok"}
-```
+| Variable | Default |
+|---|---|
+| `HYPERVISOR_BACKEND` | `local_ch` (in compose); `mock` (in `.env.example` for dev) |
+| `CH_BINARY` | `/usr/local/bin/cloud-hypervisor` |
+| `CH_KERNEL` | `/var/lib/cloud-hypervisor/vmlinux` |
+| `CH_IMAGE_DIR` | `/var/lib/cloud-hypervisor/images` |
+| `CH_BRIDGE` | `br0` |
+| `CH_TAP_PREFIX` | `tap` |
+| `CH_DISK_DIR` | `./var/runtime-disks` (in compose: `/app/var/runtime-disks`) |
+| `CH_API_SOCKET_DIR` | `./var/ch-sockets` |
+| `CH_SEED_DIR` | (empty by default) |
+| `CH_SEED_FILE` | `seed.iso` |
 
-### 11.2. Readiness (DB + Lab Agent reachable)
+### Lab Agent
 
-```bash
-$ curl -s http://localhost:8000/readyz
-{"status":"ready","database":"ok","lab_agent":"ok"}
-```
+| Variable | Default | Notes |
+|---|---|---|
+| `LAB_AGENT_BASE_URL` | `http://172.30.0.10:9001` | Bootstrap URL for the **first** lab only. Subsequent labs use their own `vm_ip`. |
+| `DEVICE_READINESS_TIMEOUT_SEC` | `1800` | **Do not lower** — Juniper routers need ~15 min to boot. |
+| `DEVICE_READINESS_POLL_SEC` | `5` | |
 
-### 11.3. Empty lab list
+### Backend server
 
-```bash
-$ curl -s http://localhost:8000/api/v1/labs
-[]
-```
+| Variable | Default |
+|---|---|
+| `BACKEND_HOST` | `0.0.0.0` |
+| `BACKEND_PORT` | `8000` |
 
-### 11.4. Happy path: create → poll → LAB_READY
+---
 
-```bash
-$ curl -s -XPOST http://localhost:8000/api/v1/labs \
-    -H 'content-type: application/json' \
-    -d '{"lab_type":"ospf","cpu":4,"memory":"4G"}'
-{"lab_id":"lab-ba0680ce0368","user_id":null,"lab_type":"ospf","golden_image":"ospf.qcow2","status":"REQUESTED","progress":5,"cpu":4,"memory_mb":4096,"subnet":null,"gateway":null,"vm_ip":null,"vm_pid":null,"tap_name":null,"error":null,"created_at":"2026-08-26T12:40:05.493685Z","started_at":null,"ready_at":null,"terminated_at":null}
+## 10. Operational commands
 
-# Poll immediately, then again ~3 s later, then ~7 s later:
-$ curl -s http://localhost:8000/api/v1/labs/lab-ba0680ce0368
-{"lab_id":"lab-ba0680ce0368",... "status":"CREATING","progress":10, ...}
+The `Makefile` exposes every common operation. Run `make help` for the full
+list.
 
-$ curl -s http://localhost:8000/api/v1/labs/lab-ba0680ce0368
-{"lab_id":"lab-ba0680ce0368",... "status":"DEVICES_BOOTING","progress":85,
- "subnet":"172.30.4.0/24","gateway":"172.30.4.1","vm_ip":"172.30.4.10",
- "vm_pid":15441001,"tap_name":"tap-lab-ba0680ce", ...}
+### Stack lifecycle
 
-$ curl -s http://localhost:8000/api/v1/labs/lab-ba0680ce0368
-{"lab_id":"lab-ba0680ce0368",... "status":"LAB_READY","progress":100,
- "ready_at":"2026-08-26T12:40:12.282715Z", ...}
-```
+| Command | What it does |
+|---|---|
+| `make up` | Start Postgres only (docker compose) |
+| `make up-ipam` | Start Postgres + IPAM service |
+| `make up-all` | Start Postgres + IPAM service + Backend |
+| `make up-backend` | Alias for `up-all` |
+| `make down` | Stop and remove all containers |
+| `make migrate` | Apply Alembic migrations against the running postgres |
 
-### 11.5. Unknown `lab_type` → 400
+### Native process lifecycle (developer mode)
 
-```bash
-$ curl -s -XPOST http://localhost:8000/api/v1/labs \
-    -H 'content-type: application/json' \
-    -d '{"lab_type":"mpls","cpu":4,"memory":"4G"}'
-{"error":{"code":"VALIDATION_ERROR","message":"request validation failed",
-  "details":[{"type":"value_error","loc":["body","lab_type"],
-   "msg":"Value error, lab_type must be one of ['bgp', 'enterprise', 'ospf', 'switching', 'vlan']",
-   "input":"mpls",
-   "ctx":{"error":"lab_type must be one of ['bgp', 'enterprise', 'ospf', 'switching', 'vlan']"}}]}}
-```
+| Command | What it does |
+|---|---|
+| `make ipam` | Run IPAM service in foreground (reload) |
+| `make ipam-bg` | Run IPAM service in background (logs → `var/ipam.log`) |
+| `make backend` | Run backend in foreground (reload) |
+| `make backend-bg` | Run backend in background (logs → `var/backend.log`) |
+| `make agent` | Run Lab Agent in foreground (inside a VM, not on host) |
+| `make agent-bg` | Run Lab Agent in background |
+| `make clean` | Kill background processes, remove `var/` |
 
-### 11.6. Invalid `memory` (number instead of string) → 400
+### Tests & install
+
+| Command | What it does |
+|---|---|
+| `make install` | Install backend + lab_agent + ipam_service into `.venv` |
+| `make install-backend` | Install backend only |
+| `make install-agent` | Install lab_agent only |
+| `make install-ipam` | Install ipam_service only |
+| `make test` | Run backend pytest suite (18 tests) |
+
+### Reset environment (dangerous)
+
+`reset_environment.sh` is an emergency script — it kills any leftover
+`cloud-hypervisor` processes, removes leftover `tap-*` interfaces, deletes
+runtime artifacts, and wipes non-terminal lab rows:
 
 ```bash
-$ curl -s -XPOST http://localhost:8000/api/v1/labs \
-    -H 'content-type: application/json' \
-    -d '{"lab_type":"ospf","cpu":4,"memory":4096}'
-{"error":{"code":"VALIDATION_ERROR","message":"request validation failed",
-  "details":[{"type":"string_type","loc":["body","memory"],
-   "msg":"Input should be a valid string","input":4096}]}}
+./reset_environment.sh
 ```
 
-### 11.7. Destroyed record (full lifecycle timestamps)
+This is destructive. Do not run while student labs are active.
+
+---
+
+## 11. Testing
+
+### Backend
 
 ```bash
-$ curl -s http://localhost:8000/api/v1/labs/lab-ba0680ce0368
-{"lab_id":"lab-ba0680ce0368","user_id":null,"lab_type":"ospf","golden_image":"ospf.qcow2",
- "status":"DESTROYED","progress":100,"cpu":4,"memory_mb":4096,
- "subnet":"172.30.4.0/24","gateway":"172.30.4.1","vm_ip":"172.30.4.10",
- "vm_pid":15441001,"tap_name":"tap-lab-ba0680ce","error":null,
- "created_at":"2026-08-26T12:40:05.493685Z",
- "started_at":"2026-08-26T12:40:05.947321Z",
- "ready_at":"2026-08-26T12:40:12.282715Z",
- "terminated_at":"2026-08-26T12:40:42.765730Z"}
+cd backend
+../.venv/bin/python -m pytest tests/ -v
 ```
 
-### 11.8. Unknown lab → 404
+The suite has 18 tests:
+
+| File | Tests |
+|---|---|
+| `tests/test_state_machine.py` | Transition legality, progress monotonicity, terminal states |
+| `tests/test_ipam.py` | Allocator distinctness, release+reuse, soft release (against the in-tree `IPAMService` class — the service itself is exercised by `ipam_service/`) |
+| `tests/test_api_labs.py` | REST endpoints: 201, 422, 404, 202, list, health |
+| `tests/test_e2e_workflow.py` | Full lifecycle `REQUESTED → LAB_READY`, destroy, device-boot timeout |
+
+Tests use **SQLite** (`aiosqlite`) and monkeypatch both the IPAM HTTP client
+and the Lab Agent HTTP client, so no Postgres, no IPAM service, no Lab Agent,
+and no real VM are required.
+
+### IPAM service
 
 ```bash
-$ curl -s http://localhost:8000/api/v1/labs/lab-does-not-exist
-{"error":{"code":"LAB_NOT_FOUND","message":"no lab lab-does-not-exist"}}
+cd ipam_service
+../.venv/bin/python -m pytest tests/ -v   # (scaffold only — add tests as needed)
 ```
 
-### 11.9. Destroy (async)
+### Lab Agent
 
 ```bash
-$ curl -s -XDELETE http://localhost:8000/api/v1/labs/lab-ba0680ce0368
-{"lab_id":"lab-ba0680ce0368",... "status":"LAB_READY","progress":100, ...}
-# (note: the orchestrator runs in the background; poll again in a couple seconds)
-$ curl -s http://localhost:8000/api/v1/labs/lab-ba0680ce0368
-{"lab_id":"lab-ba0680ce0368",... "status":"DESTROYED","progress":100,
- "terminated_at":"2026-08-26T12:40:42.765730Z", ...}
+cd lab_agent
+../.venv/bin/python -m pytest tests/ -v
 ```
 
-### 11.10. WebSocket terminal gateway
+### WebSocket smoke tests
 
 ```bash
-$ .venv/bin/python scripts/test_ws.py lab-ba0680ce0368
-RECV: '\r\n*** JUNOS stub console for r1 ***\r\nlab-type: ospf\r\nlogin: '
-RECV: '\r\nr1# show interfaces terse\r\n'
+# Through the backend gateway
+python scripts/test_ws.py lab-7f8a1b2c3d4e
+
+# Direct to the Lab Agent (set vm_ip in the script)
+python scripts/test_ws_direct.py
 ```
 
-The first `RECV` is the banner pushed by the Lab Agent as soon as the gateway opens the
-upstream WebSocket. The second is the echoed command — the gateway pumped your `send` back
-through the Lab Agent, which echoed it as a fake Junos prompt.
-
-### 11.11. Pytest
-
-```bash
-$ make test
-# or, directly:
-$ cd backend && ../.venv/bin/python -m pytest -x -q
-backend/tests/test_state_machine.py::test_terminal_statuses PASSED
-backend/tests/test_state_machine.py::test_happy_path_transitions PASSED
-backend/tests/test_state_machine.py::test_illegal_transition PASSED
-backend/tests/test_state_machine.py::test_failed_can_be_cleaned_up PASSED
-backend/tests/test_state_machine.py::test_progress_monotonic PASSED
-backend/tests/test_ipam.py::test_allocate_returns_distinct_subnets PASSED
-backend/tests/test_ipam.py::test_allocate_then_release_then_reuse PASSED
-backend/tests/test_ipam.py::test_soft_release_marks_row PASSED
-backend/tests/test_api_labs.py::test_create_lab_returns_201_and_lab_id PASSED
-backend/tests/test_api_labs.py::test_create_lab_invalid_type_422 PASSED
-backend/tests/test_api_labs.py::test_create_lab_bad_memory_422 PASSED
-backend/tests/test_api_labs.py::test_get_lab_404 PASSED
-backend/tests/test_api_labs.py::test_list_labs_includes_recently_created PASSED
-backend/tests/test_api_labs.py::test_health_endpoints PASSED
-backend/tests/test_api_labs.py::test_delete_lab_transitions_to_stopping PASSED
-backend/tests/test_e2e_workflow.py::test_full_lifecycle_to_lab_ready PASSED
-backend/tests/test_e2e_workflow.py::test_destroy_cleans_up PASSED
-backend/tests/test_e2e_workflow.py::test_device_boot_timeout_marks_failed PASSED
-18 passed in ~10s
-```
+---
 
 ## 12. Adding a new lab type
 
-1. Add a topology file: `lab_agent/topologies/<lab_type>.clab.yml` (use the existing
-   `ospf.clab.yml` as a template — swap the nodes and links for whatever your new lab needs;
-   `kind` may be `linux`, `juniper_vjunos-router`, `juniper_vjunos-switch`, etc.).
-2. Add the entry to `backend/app/registry.py`:
+Each lab type maps 1:1 to a **golden image**. Adding a new type is a three-step
+process — no code changes required in the IPAM service or the state machine.
 
-   ```python
-   "mpls": LabTypeConfig(
-       name="mpls",
-       golden_image="mpls.qcow2",
-       topology_file="mpls.clab.yml",
-       default_devices=("r1", "r2", "r3"),
-   ),
+### Step 1 — Bake the golden image
+
+On a workstation with `containerlab` + `vrnetlab` + your target Juniper image:
+
+1. Build a rootfs that, on first boot:
+   - Brings up `eth0` with `ip=<vm_ip>::<gateway>:<mask>::eth0:off`
+     (the values come from the backend via the seed ISO or kernel cmdline)
+   - Installs Docker, ContainerLab, vrnetlab
+   - Drops your `.clab.yml` at `/opt/lab_agent/topologies/<your_lab>.clab.yml`
+   - Installs a `systemd` unit that runs `lab_agent` on `:9001`
+2. Convert to qcow2:
+   ```bash
+   qemu-img convert -O qcow2 rootfs.raw your_lab.qcow2
    ```
+3. Copy the qcow2 (and the matching kernel + seed ISO) to the CH host.
 
-3. Add it to the allow-list in `backend/app/schemas.py` (`_LAB_TYPES`) so Pydantic accepts it.
-4. (Real path) Build a `mpls.qcow2` golden image following [§6.2](#62-build-the-golden-image).
+### Step 2 — Register the lab type
 
-That's it — `POST /api/v1/labs { "lab_type": "mpls" }` will now work.
+Edit `backend/app/registry.py`:
 
-## 13. License
+```python
+REGISTRY: dict[str, LabTypeConfig] = {
+    "router": LabTypeConfig(name="router", golden_image="router.qcow2"),
+    "switch": LabTypeConfig(name="switch", golden_image="switch.qcow2"),
+    # add yours:
+    "my-new-lab": LabTypeConfig(name="my-new-lab", golden_image="my-new-lab.qcow2"),
+}
+```
 
-Internal project. See your organization's standard internal-software notice.
+### Step 3 — Use it
+
+```bash
+curl -X POST http://localhost:8000/api/v1/labs \
+  -H 'Content-Type: application/json' \
+  -d '{"lab_type":"my-new-lab","cpu":4,"memory":"8G"}'
+```
+
+That's it. The state machine, orchestrator, IPAM, and quota manager all key
+off the string `lab_type` and don't need to be touched.
+
+---
+
+## 13. Troubleshooting
+
+### `/healthz` returns OK but `/readyz` is "degraded"
+
+The backend can reach Postgres but the **Lab Agent at `LAB_AGENT_BASE_URL` is
+unreachable**. This is expected behaviour in two cases:
+1. No lab is running yet (the URL points at a not-yet-allocated IP).
+2. `HYPERVISOR_BACKEND=mock` is in effect — mock VMs don't expose a real
+   Lab Agent port, so the readiness check returns "degraded" by design.
+
+If `HYPERVISOR_BACKEND=local_ch` and you see "degraded" while a lab is
+running, the Lab Agent inside the microVM has failed to start. Inspect:
+
+```bash
+tail -f var/ch-logs/<lab_id>.log
+```
+
+### `POST /api/v1/labs` returns 503 `IPAM_EXHAUSTED`
+
+The IPAM pool is full. Either:
+- Widen `IPAM_POOL` (e.g. `172.30.0.0/12` → 1024 `/24` blocks).
+- Wait for existing labs to be destroyed.
+
+### `POST /api/v1/labs` returns 500 with "ipam-service unreachable"
+
+The backend container can't reach the IPAM container. Check:
+
+```bash
+docker compose ps                  # is ipam-service running?
+docker compose logs ipam-service   # any startup errors?
+curl http://localhost:8100/healthz # is the IPAM service itself up?
+```
+
+If you're running the backend natively and IPAM in docker, make sure
+`IPAM_SERVICE_URL=http://localhost:8100` in your local `.env`.
+
+### `cloud-hypervisor exited immediately with code N`
+
+`CH_BINARY`, `CH_KERNEL`, or `CH_IMAGE_DIR` is wrong, or KVM is unavailable.
+Check:
+
+```bash
+ls -la /dev/kvm
+ls -la /usr/local/bin/cloud-hypervisor
+ls -la /var/lib/cloud-hypervisor/vmlinux
+ls /var/lib/cloud-hypervisor/images/
+tail var/ch-logs/<lab_id>.log    # last 2KB of CH stderr
+```
+
+### `DEVICE_READINESS_TIMEOUT` keeps tripping
+
+Your golden image's ContainerLab topology is taking longer than
+`DEVICE_READINESS_TIMEOUT_SEC` seconds for all devices to come up. Juniper
+vJunos routers commonly need 12–15 minutes. **Do not lower the timeout below
+~1200s without testing.** Either:
+- Raise the timeout (`.env` + `make up-all`).
+- Optimise your golden image (faster vrnetlab boot, smaller topology).
+
+### `tap-lab-...` interfaces accumulate after labs are destroyed
+
+`reset_environment.sh` will sweep them:
+
+```bash
+./reset_environment.sh
+```
+
+If they keep accumulating, the TAP cleanup in `local_ch.stop()` or
+`networking.remove_tap()` is failing — check `var/backend.log` for warnings.
+
+### `database is locked` errors during pytest
+
+SQLite under concurrent test load. Two options:
+- Run tests serially: `pytest -x -q`.
+- Switch the test fixture to use a real Postgres (already supported via
+  `DATABASE_URL=postgresql+...`).
+
+### Tests pass in isolation but fail together
+
+The autouse fixtures clean tables between tests, but `aiosqlite` + a single
+SQLite file can race. Either run tests serially or point `conftest.py` at
+Postgres for CI:
+
+```bash
+DATABASE_URL=postgresql+asyncpg://lab:lab@localhost:5432/labplatform_test \
+DATABASE_URL_SYNC=postgresql://lab:lab@localhost:5432/labplatform_test \
+  pytest tests/
+```
+
+---
+
+## 14. License
+
+Proprietary — internal use only. (See `backend/pyproject.toml`.)

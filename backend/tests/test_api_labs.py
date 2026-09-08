@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from app.db import SessionLocal
-from app.models import Lab
-from app.orchestrator import workflow as wf
-
 
 @pytest.mark.asyncio
 async def test_create_lab_returns_201_and_lab_id(client):
-    r = await client.post("/api/v1/labs", json={"lab_type": "ospf", "cpu": 4, "memory": "4G"})
+    r = await client.post("/api/v1/labs", json={"lab_type": "router", "cpu": 4, "memory": "4G"})
     assert r.status_code == 201, r.text
     body = r.json()
     assert body["lab_id"].startswith("lab-")
@@ -25,7 +21,7 @@ async def test_create_lab_invalid_type_422(client):
 
 @pytest.mark.asyncio
 async def test_create_lab_bad_memory_422(client):
-    r = await client.post("/api/v1/labs", json={"lab_type": "ospf", "cpu": 2, "memory": "huge"})
+    r = await client.post("/api/v1/labs", json={"lab_type": "router", "cpu": 2, "memory": "huge"})
     assert r.status_code == 422
 
 
@@ -38,8 +34,8 @@ async def test_get_lab_404(client):
 
 @pytest.mark.asyncio
 async def test_list_labs_includes_recently_created(client):
-    a = (await client.post("/api/v1/labs", json={"lab_type": "ospf"})).json()
-    b = (await client.post("/api/v1/labs", json={"lab_type": "bgp"})).json()
+    a = (await client.post("/api/v1/labs", json={"lab_type": "router"})).json()
+    b = (await client.post("/api/v1/labs", json={"lab_type": "switch"})).json()
     r = await client.get("/api/v1/labs")
     assert r.status_code == 200
     ids = [lab["lab_id"] for lab in r.json()]
@@ -56,7 +52,7 @@ async def test_health_endpoints(client):
 
 @pytest.mark.asyncio
 async def test_delete_lab_transitions_to_stopping(client):
-    body = (await client.post("/api/v1/labs", json={"lab_type": "ospf"})).json()
+    body = (await client.post("/api/v1/labs", json={"lab_type": "router"})).json()
     lab_id = body["lab_id"]
     # wait for the background task to settle the lab to a stable state
     import asyncio as _asyncio

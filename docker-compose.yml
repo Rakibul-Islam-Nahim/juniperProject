@@ -15,6 +15,82 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - labnet
+
+  ipam-service:
+    build:
+      context: .
+      dockerfile: ipam_service/Dockerfile
+    container_name: labplatform-ipam
+    environment:
+      APP_NAME: lab-ipam-service
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://lab:lab@postgres:5432/labplatform
+      DATABASE_URL_SYNC: postgresql://lab:lab@postgres:5432/labplatform
+      IPAM_POOL: 172.30.0.0/16
+      IPAM_PREFIX_LEN: 24
+    ports:
+      - "8100:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - labnet
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: labplatform-backend
+    environment:
+      APP_NAME: lab-platform-backend
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://lab:lab@postgres:5432/labplatform
+      DATABASE_URL_SYNC: postgresql://lab:lab@postgres:5432/labplatform
+      IPAM_SERVICE_URL: http://ipam-service:8100
+      IPAM_POOL: 172.30.0.0/16
+      IPAM_PREFIX_LEN: 24
+      MAX_LABS_PER_HOST: 10
+      CPU_QUOTA: 64
+      MEM_QUOTA_MB: 131072
+      HYPERVISOR_BACKEND: local_ch
+      CH_BINARY: /usr/local/bin/cloud-hypervisor
+      CH_KERNEL: /var/lib/cloud-hypervisor/vmlinux
+      CH_IMAGE_DIR: /var/lib/cloud-hypervisor/images
+      CH_BRIDGE: br0
+      CH_TAP_PREFIX: tap
+      CH_DISK_DIR: /app/var/runtime-disks
+      CH_API_SOCKET_DIR: /app/var/ch-sockets
+      CH_SEED_DIR: /var/lib/cloud-hypervisor/seed
+      CH_SEED_FILE: seed.iso
+      LAB_AGENT_BASE_URL: http://172.30.0.10:9001
+      # Juniper routers in the lab take ~15 minutes to boot. Do NOT reduce.
+      DEVICE_READINESS_TIMEOUT_SEC: 1800
+      DEVICE_READINESS_POLL_SEC: 5
+      BACKEND_HOST: 0.0.0.0
+      BACKEND_PORT: 8000
+    # --privileged + network_mode: host lets the container:
+    #   - create TAP interfaces on the host
+    #   - attach them to the host bridge (br0)
+    #   - invoke the cloud-hypervisor binary
+    privileged: true
+    network_mode: host
+    volumes:
+      - /usr/local/bin/cloud-hypervisor:/usr/local/bin/cloud-hypervisor:ro
+      - /var/lib/cloud-hypervisor:/var/lib/cloud-hypervisor
+      - ./var:/app/var
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ipam-service:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   labplatform_pgdata:
+
+networks:
+  labnet:
+    driver: bridge
