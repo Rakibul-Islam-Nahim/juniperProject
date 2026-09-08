@@ -4,39 +4,7 @@ An on-demand, isolated network-lab platform that boots **Juniper routers and swi
 inside **Cloud Hypervisor microVMs** running **ContainerLab**, then gives each student a
 private, console-attached lab they can tear down with a single API call.
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│  Student Browser                                                   │
-│     │  POST /api/v1/labs                                           │
-│     │  GET  /api/v1/labs/{id}                                      │
-│     │  WS   /api/v1/labs/{id}/terminal?device=r1                   │
-│     │  DELETE /api/v1/labs/{id}                                    │
-└──────────────┬─────────────────────────────────────────────────────┘
-               │
-               ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  Backend Agent    :8000   (Docker, privileged, host network)       │
-│  FastAPI · state machine · REST + WebSocket · calls IPAM via HTTP  │
-└──────────────┬─────────────────────────────────────────────────────┘
-               │   HTTP /allocate, /release
-               ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  IPAM Service     :8100   (Docker)                                 │
-│  FastAPI · owns the ip_allocations table                           │
-└──────────────┬─────────────────────────────────────────────────────┘
-               │   asyncpg
-               ▼
-┌────────────────────────────────────────────────────────────────────┐
-│  PostgreSQL 16    :5432   (Docker, persistent volume)              │
-└────────────────────────────────────────────────────────────────────┘
-
-                ┌──────────────────────────────┐
-                │ MicroVM (per student lab)    │ ← cloud-hypervisor
-                │  Lab Agent :9001             │
-                │  ContainerLab                │
-                │  vJunos / vMX / cRPD         │
-                └──────────────────────────────┘
-```
+![Lab Network Architecture](github-content/Lab_network_architecture.png)
 
 ---
 
@@ -220,60 +188,7 @@ stack. That's why the backend container runs with `--privileged` and `network_mo
 Every lab moves through a strict, auditable FSM. The backend records each transition
 in `lab_events` (from_status, to_status, message, created_at).
 
-```
-   ┌──────────┐
-   │REQUESTED │ ← POST /api/v1/labs inserts row, kicks off run_lab()
-   └────┬─────┘
-        ▼
-   ┌──────────┐
-   │CREATING  │ ← resource quota check
-   └────┬─────┘
-        ▼
-   ┌───────────────────┐
-   │NETWORK_ALLOCATED  │ ← HTTP POST /allocate to ipam-service
-   └────┬──────────────┘
-        ▼
-   ┌──────────┐
-   │VM_STARTING│ ← cloud-hypervisor --net tap=tap-<lab_id>
-   └────┬─────┘
-        ▼
-   ┌──────────┐
-   │ VM_READY │ ← poll Lab Agent /health at http://<vm_ip>:9001/health
-   └────┬─────┘
-        ▼
-   ┌─────────────────────┐
-   │CONTAINERLAB_STARTING│ ← Lab Agent auto-deploys topology on its own boot
-   └────┬────────────────┘
-        ▼
-   ┌─────────────────┐
-   │DEVICES_BOOTING  │ ← poll /status until all devices ready
-   └────┬────────────┘
-        ▼
-   ┌──────────┐
-   │ LAB_READY│ ← 100% — student can connect
-   └────┬─────┘
-        │  DELETE /api/v1/labs/{id}
-        ▼
-   ┌──────────┐
-   │ STOPPING │
-   └────┬─────┘
-        ▼
-   ┌────────────┐
-   │VM_STOPPED  │ ← cloud-hypervisor /vm.shutdown
-   └────┬───────┘
-        ▼
-   ┌────────────────────┐
-   │RESOURCES_RELEASED  │ ← HTTP POST /release to ipam-service + TAP removal
-   └────┬───────────────┘
-        ▼
-   ┌──────────┐
-   │DESTROYED │ ← terminal
-   └──────────┘
-
-   (any state) ──on error──▶ ┌──────────┐
-                              │  FAILED  │ ← terminal; auto-cleanup
-                              └──────────┘
-```
+![MicroVM Architecture](github-content/microvm_architecture.png)
 
 ### Progress percentages (returned by `/api/v1/labs/{id}`)
 
